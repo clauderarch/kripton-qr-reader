@@ -15,5 +15,5 @@ walkdir = "2.3"
 dirs = "6.0"
 
 [[bin]]
-name = "kripton-qr" 
+name = "kripton-qr-reader" 
 path = "src/main.rs"
