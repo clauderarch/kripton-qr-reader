@@ -194,7 +194,7 @@ fn main() -> AppResult<()> {
     let mut running = true;
 
     while running {
-        println!("\n--- QR Code Reader CLI ---");
+        println!("\n--- Kripton QR Code Reader ---");
         println!("1. Read QR Code from Images in Scan Directory");
         println!("2. Scan Directory Settings");
         println!("3. Exit");
