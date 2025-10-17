@@ -8,6 +8,7 @@ Kripton QR Code Reader is a simple Command Line Interface (CLI) application desi
 * **Robust QR Reading:** Uses the reliable `quircs` engine combined with custom pre-processing (Adaptive Thresholding) to enhance the decoding of poor-quality or stylized QR codes.
 * **Persistent Settings:** Saves your scan directory settings permanently in a standard operating system data directory (e.g., `$HOME/.local/share/kripton-qr-reader/settings.json` on Linux).
 * **Fully Local:** It works without needing even the slightest internet connection. It keeps your data safe.
+* **Auto Copying Feature:** You can copy your QR code content automaticly. You can enable or disable this feature on setting menu.
 
 ## Installation
 
@@ -53,13 +54,13 @@ The application will present you with the main menu:
 ```bash
 --- QR Code Reader CLI ---
 1. Read QR Code from Images in Scan Directory
-2. Scan Directory Settings
+2. Settings
 3. Exit
 Make your selection (1-3):
 ```
-### 1. Scan Directory Settings
-Select 2 to configure the directory where your images are located. Enter the full path to your image folder. This setting will be saved permanently unless you change it again.
-
+### 1. Settings
+Select 1 to configure the directory where your images are located. Enter the full path to your image folder. This setting will be saved permanently unless you change it again.
+You can enable auto copying feature here.
 ### 2. Read QR Code
 After setting the scan directory, select 1. The application will list all supported images in that folder.
 1. Enter the number corresponding to the image you want to scan.
