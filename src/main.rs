@@ -6,6 +6,7 @@ use zeroize::Zeroizing;
 use serde::{Serialize, Deserialize};
 use walkdir::WalkDir;
 use dirs;
+use arboard::Clipboard;
 
 type AppResult<T> = Result<T>;
 const APP_NAME: &str = "kripton-qr-reader";
@@ -15,12 +16,15 @@ const SETTINGS_FILENAME: &str = "settings.json";
 struct AppSettings {
     #[serde(default)] 
     scan_directory: Option<PathBuf>,
+    #[serde(default)]
+    auto_copy_to_clipboard: bool,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         AppSettings {
             scan_directory: None,
+            auto_copy_to_clipboard: false,
         }
     }
 }
@@ -185,20 +189,20 @@ fn read_qr_code(settings: &AppSettings) -> AppResult<()> {
         println!("No supported image files found in the directory (Supported: {:?}).", supported_extensions);
         return Ok(());
     }
-    
+
     files.sort();
     println!("\nFound Images (Alphabetical Order):");
     for (i, file) in files.iter().enumerate() {
         let file_name = file.file_name().unwrap_or_default().to_string_lossy();
         println!("{}. {}", i + 1, file_name);
     }
-    
+
     print!("Please enter the number of the image to read (1-{}): ", files.len());
     io::stdout().flush()?;
-    
+
     let mut choice = String::new();
     io::stdin().read_line(&mut choice)?;
-    
+
     let index: usize = match choice.trim().parse::<usize>() {
         Ok(n) if n > 0 && n <= files.len() => n - 1,
         _ => {
@@ -214,21 +218,21 @@ fn read_qr_code(settings: &AppSettings) -> AppResult<()> {
         .with_context(|| format!("Could not open image file: {}", path.display()))?;
 
     println!("Processing image with multiple techniques...");
-    
+
     let processed_images = try_different_scales(&img);
-    
+
     let mut all_results = Vec::new();
-    
-    for (technique_idx, processed_img) in processed_images.iter().enumerate() {
+
+    for (_technique_idx, processed_img) in processed_images.iter().enumerate() {
         let mut prepared_img = rqrr::PreparedImage::prepare(processed_img.clone());
         let grids = prepared_img.detect_grids();
-        
+
         for grid in grids {
             if let Ok((_metadata, content)) = grid.decode() {
                 let content_str = content;
-                
+
                 if !all_results.iter().any(|(_, c)| c == &content_str) {
-                    all_results.push((technique_idx, content_str));
+                    all_results.push((_technique_idx, content_str));
                 }
             }
         }
@@ -242,9 +246,32 @@ fn read_qr_code(settings: &AppSettings) -> AppResult<()> {
 
     println!("\n{} unique QR code(s) successfully decoded!", all_results.len());
 
+    if settings.auto_copy_to_clipboard && all_results.len() == 1 {
+    if let Some((_, content)) = all_results.first() {
+        let copy_result = (|| -> Result<()> {
+            let mut clipboard = Clipboard::new().context("Failed to initialize clipboard")?;
+            clipboard.set_text(content.clone())
+                .context("Failed to copy content to clipboard")?;
+            #[cfg(target_os = "linux")]
+            {
+                use std::thread;
+                use std::time::Duration;
+                thread::sleep(Duration::from_millis(100));
+            }
+            Ok(())
+        })();
+
+        if copy_result.is_ok() {
+            println!("Content of the QR code has been automatically copied to the clipboard.");
+        } else if let Err(e) = copy_result {
+            eprintln!("Warning: Could not copy content to clipboard: {:?}", e);
+        }
+    }
+}
+
     for (i, (_technique, content)) in all_results.iter().enumerate() {
         let zeroized_content = Zeroizing::new(content.clone());
-        
+
         println!("--- QR Code {} ---", i + 1);
         println!("Content: {}", zeroized_content.as_str());
     }
@@ -253,35 +280,63 @@ fn read_qr_code(settings: &AppSettings) -> AppResult<()> {
 }
 
 fn settings_menu(settings: &mut AppSettings) -> AppResult<()> {
-    println!("\n--- Settings ---");
-    
-    match &settings.scan_directory {
-        Some(p) => println!("Current Scan Directory: {}", p.display()),
-        None => println!("Current Scan Directory: NOT SET"),
-    }
-    
-    print!("Enter New Scan Directory Path: ");
-    io::stdout().flush()?; 
+    let mut in_settings_menu = true;
+    while in_settings_menu {
+        println!("\n--- Settings Menu ---");
 
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let new_path_str = input.trim();
-
-    if !new_path_str.is_empty() {
-        let path_buf = PathBuf::from(new_path_str);
-        if path_buf.is_dir() {
-            settings.scan_directory = Some(path_buf);
-            println!("Scan directory set successfully. Saving...");
-            save_settings(settings)?;
-        } else {
-             println!("Error: The entered path is not a valid directory.");
+        match &settings.scan_directory {
+            Some(p) => println!("1. Set Scan Directory (Current: {})", p.display()),
+            None => println!("1. Set Scan Directory (Current: NOT SET)"),
         }
-    } else {
-        println!("Input was left empty, setting not changed.");
-    }
 
+        let auto_copy_status = if settings.auto_copy_to_clipboard { "Enabled" } else { "Disabled" };
+        println!("2. Toggle Auto-copy to Clipboard (Current: {})", auto_copy_status);
+        
+        println!("3. Back to Main Menu");
+        print!("Make your selection (1-3): ");
+        io::stdout().flush()?;
+
+        let mut choice = String::new();
+        io::stdin().read_line(&mut choice)?;
+
+        match choice.trim() {
+            "1" => {
+                print!("Enter New Scan Directory Path (or leave empty to cancel): ");
+                io::stdout().flush()?;
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                let new_path_str = input.trim();
+
+                if !new_path_str.is_empty() {
+                    let path_buf = PathBuf::from(new_path_str);
+                    if path_buf.is_dir() {
+                        settings.scan_directory = Some(path_buf);
+                        println!("Scan directory updated successfully. Saving...");
+                        save_settings(settings)?;
+                    } else {
+                        println!("Error: The entered path is not a valid directory.");
+                    }
+                } else {
+                    println!("No path entered, operation cancelled.");
+                }
+            },
+            "2" => {
+                settings.auto_copy_to_clipboard = !settings.auto_copy_to_clipboard;
+                let new_status = if settings.auto_copy_to_clipboard { "Enabled" } else { "Disabled" };
+                println!("Auto-copy to clipboard is now {}. Saving...", new_status);
+                save_settings(settings)?;
+            },
+            "3" => {
+                in_settings_menu = false;
+            },
+            _ => {
+                println!("Invalid selection. Please enter 1, 2, or 3.");
+            }
+        }
+    }
     Ok(())
 }
+
 
 fn main() -> AppResult<()> {
     let mut settings = match load_settings() {
@@ -297,7 +352,7 @@ fn main() -> AppResult<()> {
     while running {
         println!("\n--- Kripton QR Code Reader ---");
         println!("1. Read QR Code from Images in Scan Directory");
-        println!("2. Scan Directory Settings");
+        println!("2. Settings");
         println!("3. Exit");
         print!("Make your selection (1-3): ");
         io::stdout().flush()?; 
@@ -318,8 +373,7 @@ fn main() -> AppResult<()> {
                 }
             },
             "3" => {
-                println!("Saving settings and exiting application...");
-                save_settings(&settings)?;
+                println!("Exiting application...");
                 running = false;
             },
             _ => {
