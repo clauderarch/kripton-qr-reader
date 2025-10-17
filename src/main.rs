@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 use anyhow::{Result, Context};
-use image::{ImageBuffer, Luma}; 
+use image::{ImageBuffer, Luma, DynamicImage}; 
 use zeroize::Zeroizing;
 use serde::{Serialize, Deserialize};
 use walkdir::WalkDir;
@@ -38,6 +38,7 @@ fn get_settings_path() -> AppResult<PathBuf> {
     path.push(SETTINGS_FILENAME);
     Ok(path)
 }
+
 fn load_settings() -> AppResult<AppSettings> {
     let settings_path = get_settings_path()?;
 
@@ -62,6 +63,98 @@ fn save_settings(settings: &AppSettings) -> AppResult<()> {
     std::fs::write(&settings_path, content)
         .context(format!("Could not write settings to file: {}", settings_path.display()))?;
     Ok(())
+}
+
+fn enhance_contrast(img: &ImageBuffer<Luma<u8>, Vec<u8>>) -> ImageBuffer<Luma<u8>, Vec<u8>> {
+    let (width, height) = img.dimensions();
+    let mut enhanced = ImageBuffer::new(width, height);
+    
+    let mut histogram = [0u32; 256];
+    for pixel in img.pixels() {
+        histogram[pixel[0] as usize] += 1;
+    }
+    
+    let total_pixels = (width * height) as f32;
+    let mut cdf = [0.0f32; 256];
+    let mut sum = 0.0;
+    
+    for i in 0..256 {
+        sum += histogram[i] as f32 / total_pixels;
+        cdf[i] = sum;
+    }
+    
+    for (x, y, pixel) in enhanced.enumerate_pixels_mut() {
+        let old_val = img.get_pixel(x, y)[0] as usize;
+        let new_val = (cdf[old_val] * 255.0) as u8;
+        *pixel = Luma([new_val]);
+    }
+    
+    enhanced
+}
+
+fn adaptive_threshold(img: &ImageBuffer<Luma<u8>, Vec<u8>>, block_size: u32) -> ImageBuffer<Luma<u8>, Vec<u8>> {
+    let (width, height) = img.dimensions();
+    let mut result = ImageBuffer::new(width, height);
+    let half_block = block_size / 2;
+    
+    for y in 0..height {
+        for x in 0..width {
+            let x_start = x.saturating_sub(half_block);
+            let x_end = (x + half_block).min(width - 1);
+            let y_start = y.saturating_sub(half_block);
+            let y_end = (y + half_block).min(height - 1);
+            
+            let mut sum = 0u32;
+            let mut count = 0u32;
+            
+            for yy in y_start..=y_end {
+                for xx in x_start..=x_end {
+                    sum += img.get_pixel(xx, yy)[0] as u32;
+                    count += 1;
+                }
+            }
+            
+            let mean = sum / count;
+            let pixel_val = img.get_pixel(x, y)[0] as u32;
+            
+            let new_val = if pixel_val < mean.saturating_sub(5) { 0 } else { 255 };
+            result.put_pixel(x, y, Luma([new_val]));
+        }
+    }
+    
+    result
+}
+
+fn try_different_scales(img: &DynamicImage) -> Vec<ImageBuffer<Luma<u8>, Vec<u8>>> {
+    let mut processed_images = Vec::new();
+    
+    let img_gray = img.to_luma8();
+    processed_images.push(img_gray.clone());
+    
+    let enhanced = enhance_contrast(&img_gray);
+    processed_images.push(enhanced.clone());
+    
+    let thresholded = adaptive_threshold(&img_gray, 15);
+    processed_images.push(thresholded);
+    
+    let scaled_up = img.resize_exact(
+        (img.width() as f32 * 1.5) as u32,
+        (img.height() as f32 * 1.5) as u32,
+        image::imageops::FilterType::Lanczos3
+    ).to_luma8();
+    processed_images.push(scaled_up.clone());
+    processed_images.push(enhance_contrast(&scaled_up));
+    
+    if img.width() > 400 && img.height() > 400 {
+        let scaled_down = img.resize_exact(
+            (img.width() as f32 * 0.8) as u32,
+            (img.height() as f32 * 0.8) as u32,
+            image::imageops::FilterType::Lanczos3
+        ).to_luma8();
+        processed_images.push(scaled_down);
+    }
+    
+    processed_images
 }
 
 fn read_qr_code(settings: &AppSettings) -> AppResult<()> {
@@ -92,6 +185,7 @@ fn read_qr_code(settings: &AppSettings) -> AppResult<()> {
         println!("No supported image files found in the directory (Supported: {:?}).", supported_extensions);
         return Ok(());
     }
+    
     files.sort();
     println!("\nFound Images (Alphabetical Order):");
     for (i, file) in files.iter().enumerate() {
@@ -119,33 +213,40 @@ fn read_qr_code(settings: &AppSettings) -> AppResult<()> {
     let img = image::open(path)
         .with_context(|| format!("Could not open image file: {}", path.display()))?;
 
-    let img_gray: ImageBuffer<Luma<u8>, Vec<u8>> = img.to_luma8();
+    println!("Processing image with multiple techniques...");
     
-    let mut prepared_img = rqrr::PreparedImage::prepare(img_gray);
-    let grids = prepared_img.detect_grids(); 
+    let processed_images = try_different_scales(&img);
+    
+    let mut all_results = Vec::new();
+    
+    for (technique_idx, processed_img) in processed_images.iter().enumerate() {
+        let mut prepared_img = rqrr::PreparedImage::prepare(processed_img.clone());
+        let grids = prepared_img.detect_grids();
+        
+        for grid in grids {
+            if let Ok((_metadata, content)) = grid.decode() {
+                let content_str = content;
+                
+                if !all_results.iter().any(|(_, c)| c == &content_str) {
+                    all_results.push((technique_idx, content_str));
+                }
+            }
+        }
+    }
 
-    if grids.is_empty() {
-        println!("No QR code found in the selected image.");
+    if all_results.is_empty() {
+        println!("No QR code could be decoded from the selected image.");
+        println!("Tried {} different processing techniques.", processed_images.len());
         return Ok(());
     }
 
-    println!("{} QR codes found.", grids.len());
+    println!("\n{} unique QR code(s) successfully decoded!", all_results.len());
 
-    for (i, grid) in grids.into_iter().enumerate() {
-        match grid.decode() {
-            Ok((_metadata, content)) => {
-                let zeroized_content: Zeroizing<Vec<u8>> = Zeroizing::from(content.into_bytes());
-
-                let decoded_text = std::str::from_utf8(&zeroized_content[..]) 
-                    .context("QR code content is not valid UTF-8.")?;
-
-                println!("--- QR Code {} ---", i + 1);
-                println!("Content: {}", decoded_text);
-            },
-            Err(e) => {
-                eprintln!("QR Code {} could not be decoded: {:?}", i + 1, e);
-            }
-        }
+    for (i, (_technique, content)) in all_results.iter().enumerate() {
+        let zeroized_content = Zeroizing::new(content.clone());
+        
+        println!("--- QR Code {} ---", i + 1);
+        println!("Content: {}", zeroized_content.as_str());
     }
 
     Ok(())
