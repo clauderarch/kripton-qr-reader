@@ -96,41 +96,63 @@ fn enhance_contrast(img: &ImageBuffer<Luma<u8>, Vec<u8>>) -> ImageBuffer<Luma<u8
     enhanced
 }
 
-fn adaptive_threshold(img: &ImageBuffer<Luma<u8>, Vec<u8>>, block_size: u32) -> ImageBuffer<Luma<u8>, Vec<u8>> {
+fn compute_integral(img: &ImageBuffer<Luma<u8>, Vec<u8>>) -> Vec<Vec<u64>> {
     let (width, height) = img.dimensions();
-    let mut result = ImageBuffer::new(width, height);
-    let half_block = block_size / 2;
-    
-    for y in 0..height {
-        for x in 0..width {
-            let x_start = x.saturating_sub(half_block);
-            let x_end = (x + half_block).min(width - 1);
-            let y_start = y.saturating_sub(half_block);
-            let y_end = (y + half_block).min(height - 1);
-            
-            let mut sum = 0u32;
-            let mut count = 0u32;
-            
-            for yy in y_start..=y_end {
-                for xx in x_start..=x_end {
-                    sum += img.get_pixel(xx, yy)[0] as u32;
-                    count += 1;
-                }
-            }
-            
-            let mean = sum / count;
-            let pixel_val = img.get_pixel(x, y)[0] as u32;
-            
-            let new_val = if pixel_val < mean.saturating_sub(5) { 0 } else { 255 };
-            result.put_pixel(x, y, Luma([new_val]));
+    let w = width as usize;
+    let h = height as usize;
+    let mut integral = vec![vec![0u64; w + 1]; h + 1];
+
+    for y in 1..=h {
+        for x in 1..=w {
+            let val = img.get_pixel((x - 1) as u32, (y - 1) as u32)[0] as u64;
+            integral[y][x] = val + integral[y - 1][x] + integral[y][x - 1] - integral[y - 1][x - 1];
         }
     }
-    
+
+    integral
+}
+
+fn adaptive_threshold(img: &ImageBuffer<Luma<u8>, Vec<u8>>, block_size: u32) -> ImageBuffer<Luma<u8>, Vec<u8>> {
+    let (width, height) = img.dimensions();
+    if width == 0 || height == 0 {
+        return ImageBuffer::new(width, height);
+    }
+
+    let mut result = ImageBuffer::new(width, height);
+    let half_block = block_size / 2;
+    let integral = compute_integral(img);
+
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let x_start = x.saturating_sub(half_block as usize);
+            let x_end = (x + half_block as usize).min(width as usize - 1);
+            let y_start = y.saturating_sub(half_block as usize);
+            let y_end = (y + half_block as usize).min(height as usize - 1);
+
+            let count = ((x_end - x_start + 1) * (y_end - y_start + 1)) as u64;
+            if count == 0 {
+                result.put_pixel(x as u32, y as u32, Luma([128]));
+                continue;
+            }
+
+            let sum = integral[y_end + 1][x_end + 1]
+                .saturating_sub(integral[y_end + 1][x_start])
+                .saturating_sub(integral[y_start][x_end + 1])
+                .saturating_add(integral[y_start][x_start]);
+
+            let mean = (sum / count) as u32;
+            let pixel_val = img.get_pixel(x as u32, y as u32)[0] as u32;
+
+            let new_val = if pixel_val < mean.saturating_sub(5) { 0 } else { 255 };
+            result.put_pixel(x as u32, y as u32, Luma([new_val as u8]));
+        }
+    }
+
     result
 }
 
 fn try_different_scales(img: &DynamicImage) -> Vec<ImageBuffer<Luma<u8>, Vec<u8>>> {
-    let mut processed_images = Vec::new();
+    let mut processed_images = Vec::with_capacity(6);
     
     let img_gray = img.to_luma8();
     processed_images.push(img_gray.clone());
@@ -161,11 +183,79 @@ fn try_different_scales(img: &DynamicImage) -> Vec<ImageBuffer<Luma<u8>, Vec<u8>
     processed_images
 }
 
+fn process_image(path: &PathBuf, settings: &AppSettings) -> AppResult<()> {
+    println!("Selected image: {}", path.display());
+
+    let img = image::open(path)
+        .with_context(|| format!("Could not open image file: {}", path.display()))?;
+
+    println!("Processing image with multiple techniques...");
+
+    let processed_images = try_different_scales(&img);
+
+    let mut all_results = Vec::new();
+
+    for (_technique_idx, processed_img) in processed_images.iter().enumerate() {
+        let mut prepared_img = rqrr::PreparedImage::prepare(processed_img.clone());
+        let grids = prepared_img.detect_grids();
+
+        for grid in grids {
+            if let Ok((_metadata, content)) = grid.decode() {
+                let content_str = content;
+
+                if !all_results.iter().any(|(_, c)| c == &content_str) {
+                    all_results.push((_technique_idx, content_str));
+                }
+            }
+        }
+    }
+
+    if all_results.is_empty() {
+        println!("No QR code could be decoded from the selected image.");
+        println!("Tried {} different processing techniques.", processed_images.len());
+        return Ok(());
+    }
+
+    println!("\n{} unique QR code(s) successfully decoded!", all_results.len());
+
+    if settings.auto_copy_to_clipboard && all_results.len() == 1 {
+        if let Some((_, content)) = all_results.first() {
+            let copy_result = (|| -> Result<()> {
+                let mut clipboard = Clipboard::new().context("Failed to initialize clipboard")?;
+                clipboard.set_text(content.clone())
+                    .context("Failed to copy content to clipboard")?;
+                #[cfg(target_os = "linux")]
+                {
+                    use std::thread;
+                    use std::time::Duration;
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Ok(())
+            })();
+
+            if copy_result.is_ok() {
+                println!("Content of the QR code has been automatically copied to the clipboard.");
+            } else if let Err(e) = copy_result {
+                eprintln!("Warning: Could not copy content to clipboard: {:?}", e);
+            }
+        }
+    }
+
+    for (i, (_technique, content)) in all_results.iter().enumerate() {
+        let zeroized_content = Zeroizing::new(content.clone());
+
+        println!("--- QR Code {} ---", i + 1);
+        println!("Content: {}", zeroized_content.as_str());
+    }
+
+    Ok(())
+}
+
 fn read_qr_code(settings: &AppSettings) -> AppResult<()> {
     let scan_dir = match &settings.scan_directory {
         Some(p) => p,
         None => {
-            println!("Error: Please set the scan directory first from menu 2.");
+            println!("Error: Please set the scan directory first from menu 3.");
             return Ok(());
         }
     };
@@ -174,7 +264,11 @@ fn read_qr_code(settings: &AppSettings) -> AppResult<()> {
     let supported_extensions = &["png", "jpg", "jpeg", "bmp", "gif", "webp"];
     let mut files = Vec::new();
 
-    for entry in WalkDir::new(scan_dir).max_depth(1).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(scan_dir)
+        .max_depth(1)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.is_file() {
             if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
@@ -212,71 +306,40 @@ fn read_qr_code(settings: &AppSettings) -> AppResult<()> {
     };
 
     let path = &files[index];
-    println!("Selected image: {}", path.display());
+    process_image(path, settings)
+}
 
-    let img = image::open(path)
-        .with_context(|| format!("Could not open image file: {}", path.display()))?;
+fn read_qr_from_file(settings: &AppSettings) -> AppResult<()> {
+    print!("Enter the full path to the image file (or leave empty to cancel): ");
+    io::stdout().flush()?;
 
-    println!("Processing image with multiple techniques...");
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
 
-    let processed_images = try_different_scales(&img);
-
-    let mut all_results = Vec::new();
-
-    for (_technique_idx, processed_img) in processed_images.iter().enumerate() {
-        let mut prepared_img = rqrr::PreparedImage::prepare(processed_img.clone());
-        let grids = prepared_img.detect_grids();
-
-        for grid in grids {
-            if let Ok((_metadata, content)) = grid.decode() {
-                let content_str = content;
-
-                if !all_results.iter().any(|(_, c)| c == &content_str) {
-                    all_results.push((_technique_idx, content_str));
-                }
-            }
-        }
-    }
-
-    if all_results.is_empty() {
-        println!("No QR code could be decoded from the selected image.");
-        println!("Tried {} different processing techniques.", processed_images.len());
+    let path_str = input.trim();
+    if path_str.is_empty() {
+        println!("No path entered, operation cancelled.");
         return Ok(());
     }
 
-    println!("\n{} unique QR code(s) successfully decoded!", all_results.len());
+    let path = PathBuf::from(path_str);
+    if !path.is_file() {
+        println!("Error: The entered path is not a valid file.");
+        return Ok(());
+    }
 
-    if settings.auto_copy_to_clipboard && all_results.len() == 1 {
-    if let Some((_, content)) = all_results.first() {
-        let copy_result = (|| -> Result<()> {
-            let mut clipboard = Clipboard::new().context("Failed to initialize clipboard")?;
-            clipboard.set_text(content.clone())
-                .context("Failed to copy content to clipboard")?;
-            #[cfg(target_os = "linux")]
-            {
-                use std::thread;
-                use std::time::Duration;
-                thread::sleep(Duration::from_millis(100));
-            }
-            Ok(())
-        })();
-
-        if copy_result.is_ok() {
-            println!("Content of the QR code has been automatically copied to the clipboard.");
-        } else if let Err(e) = copy_result {
-            eprintln!("Warning: Could not copy content to clipboard: {:?}", e);
+    let supported_extensions = &["png", "jpg", "jpeg", "bmp", "gif", "webp"];
+    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+        if !supported_extensions.contains(&ext.to_lowercase().as_str()) {
+            println!("Unsupported file extension. Supported: {:?}.", supported_extensions);
+            return Ok(());
         }
-    }
-}
-
-    for (i, (_technique, content)) in all_results.iter().enumerate() {
-        let zeroized_content = Zeroizing::new(content.clone());
-
-        println!("--- QR Code {} ---", i + 1);
-        println!("Content: {}", zeroized_content.as_str());
+    } else {
+        println!("No file extension found.");
+        return Ok(());
     }
 
-    Ok(())
+    process_image(&path, settings)
 }
 
 fn settings_menu(settings: &mut AppSettings) -> AppResult<()> {
@@ -337,7 +400,6 @@ fn settings_menu(settings: &mut AppSettings) -> AppResult<()> {
     Ok(())
 }
 
-
 fn main() -> AppResult<()> {
     let mut settings = match load_settings() {
         Ok(s) => s,
@@ -352,9 +414,10 @@ fn main() -> AppResult<()> {
     while running {
         println!("\n--- Kripton QR Code Reader ---");
         println!("1. Read QR Code from Images in Scan Directory");
-        println!("2. Settings");
-        println!("3. Exit");
-        print!("Make your selection (1-3): ");
+        println!("2. Read QR Code from a Specific File");
+        println!("3. Settings");
+        println!("4. Exit");
+        print!("Make your selection (1-4): ");
         io::stdout().flush()?; 
 
         let mut choice = String::new();
@@ -368,16 +431,21 @@ fn main() -> AppResult<()> {
                 }
             },
             "2" => {
+                if let Err(e) = read_qr_from_file(&settings) {
+                    eprintln!("Error: QR code reading failed: {:?}", e);
+                }
+            },
+            "3" => {
                 if let Err(e) = settings_menu(&mut settings) {
                     eprintln!("Error: Could not change settings: {:?}", e);
                 }
             },
-            "3" => {
+            "4" => {
                 println!("Exiting application...");
                 running = false;
             },
             _ => {
-                println!("Invalid selection. Please enter 1, 2, or 3.");
+                println!("Invalid selection. Please enter 1, 2, 3, or 4.");
             }
         }
     }
