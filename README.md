@@ -8,7 +8,7 @@ Kripton QR Code Reader is a simple Command Line Interface (CLI) application desi
 * **Robust QR Reading:** Uses the reliable `quircs` engine combined with custom pre-processing (Adaptive Thresholding) to enhance the decoding of poor-quality or stylized QR codes.
 * **Persistent Settings:** Saves your scan directory settings permanently in a standard operating system data directory (e.g., `$HOME/.local/share/kripton-qr-reader/settings.json` on Linux).
 * **Fully Local:** It works without needing even the slightest internet connection. It keeps your data safe.
-* **Auto Copying Feature:** You can copy your QR code content automaticly. You can enable or disable this feature on setting menu.
+* **Auto Copying Feature:** You can copy your QR code content automaticly. You can enable or disable this feature on the settings menu.
 
 ## Installation
 
