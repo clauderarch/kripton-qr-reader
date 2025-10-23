@@ -20,6 +20,8 @@ struct AppSettings {
     scan_directory: Option<PathBuf>,
     #[serde(default)]
     auto_copy_to_clipboard: bool,
+    #[serde(default)]
+    output_directory: Option<PathBuf>,
 }
 
 impl Default for AppSettings {
@@ -27,6 +29,7 @@ impl Default for AppSettings {
         AppSettings {
             scan_directory: None,
             auto_copy_to_clipboard: false,
+            output_directory: None,
         }
     }
 }
@@ -209,8 +212,183 @@ fn process_image(path: &PathBuf, _settings: &AppSettings) -> AppResult<Vec<(Stri
     Ok(all_results)
 }
 
+fn generate_qr_code(settings: &AppSettings) -> AppResult<()> {
+    use qrcode::QrCode;
+    use qrcode::render::unicode;
+    
+    println!("\n--- Generate QR Code ---");
+    print!("Enter text to convert to QR code (or leave empty to cancel): ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let text = input.trim();
+
+    if text.is_empty() {
+        println!("No text entered, operation cancelled.");
+        return Ok(());
+    }
+
+    let code = QrCode::new(text.as_bytes())
+        .context("Could not create QR code. Text may be too long.")?;
+
+    let unicode_image = code.render::<unicode::Dense1x2>()
+        .dark_color(unicode::Dense1x2::Light)
+        .light_color(unicode::Dense1x2::Dark)
+        .build();
+    
+    println!("\nQR Code (Terminal View):");
+    println!("{}", unicode_image);
+
+    print!("\nSave QR code as a PNG file? (Y/N): ");
+    io::stdout().flush()?;
+    let mut save_choice = String::new();
+    io::stdin().read_line(&mut save_choice)?;
+
+    if save_choice.trim().to_lowercase() == "y" {
+        let default_dir = settings.output_directory.as_ref()
+            .or(settings.scan_directory.as_ref())
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| ".".to_string());
+        
+        print!("Enter file name (default: qr_code.png, directory: {}): ", default_dir);
+        io::stdout().flush()?;
+        
+        let mut filename_input = String::new();
+        io::stdin().read_line(&mut filename_input)?;
+        let filename = filename_input.trim();
+        
+        let path = if filename.is_empty() {
+            PathBuf::from(&default_dir).join("qr_code.png")
+        } else {
+            let input_path = PathBuf::from(filename);
+            if input_path.is_absolute() {
+                input_path
+            } else {
+                PathBuf::from(&default_dir).join(filename)
+            }
+        };
+
+        let image = code.render::<image::Luma<u8>>()
+            .min_dimensions(200, 200)
+            .build();
+        
+        image.save(&path)
+            .context(format!("Could not save QR code file: {}", path.display()))?;
+        
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                .context(format!("Could not set file permissions: {}", path.display()))?;
+        }
+        
+        println!("QR code saved successfully: {}", path.display());
+    }
+
+    Ok(())
+}
+
+fn batch_generate_qr_codes(settings: &AppSettings) -> AppResult<()> {
+    use qrcode::QrCode;
+    
+    println!("\n--- Batch QR Code Generation ---");
+    print!("Enter path to text file (each line will be a separate QR code): ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let file_path_str = input.trim();
+
+    if file_path_str.is_empty() {
+        println!("No file path entered, operation cancelled.");
+        return Ok(());
+    }
+
+    let file_path = PathBuf::from(file_path_str);
+    if !file_path.is_file() {
+        println!("Error: The provided path is not a valid file.");
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(&file_path)
+        .context(format!("Could not read file: {}", file_path.display()))?;
+
+    let lines: Vec<&str> = content.lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+
+    if lines.is_empty() {
+        println!("No processable text found in file.");
+        return Ok(());
+    }
+
+    println!("\n{} lines found. Generating QR codes...", lines.len());
+
+    let default_dir = settings.output_directory.as_ref()
+        .or(settings.scan_directory.as_ref())
+        .map(|p| p.clone())
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    print!("Output directory (default: {}): ", default_dir.display());
+    io::stdout().flush()?;
+    
+    let mut dir_input = String::new();
+    io::stdin().read_line(&mut dir_input)?;
+    let output_dir = if dir_input.trim().is_empty() {
+        default_dir
+    } else {
+        PathBuf::from(dir_input.trim())
+    };
+
+    if !output_dir.exists() {
+        std::fs::create_dir_all(&output_dir)
+            .context(format!("Could not create output directory: {}", output_dir.display()))?;
+    }
+
+    let mut success_count = 0;
+    let mut error_count = 0;
+
+    for (i, line) in lines.iter().enumerate() {
+        let filename = format!("qr_code_{:03}.png", i + 1);
+        let path = output_dir.join(&filename);
+
+        match QrCode::new(line.as_bytes()) {
+            Ok(code) => {
+                let image = code.render::<image::Luma<u8>>()
+                    .min_dimensions(200, 200)
+                    .build();
+                
+                match image.save(&path) {
+                    Ok(_) => {
+                        println!("✓ {} created: {}", filename, &line[..line.len().min(50)]);
+                        success_count += 1;
+                        
+                        #[cfg(unix)]
+                        {
+                            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("✗ Could not save {}: {:?}", filename, e);
+                        error_count += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("✗ Could not generate QR code for line {}: {:?}", i + 1, e);
+                error_count += 1;
+            }
+        }
+    }
+
+    println!("\nCompleted! Success: {}, Failed: {}", success_count, error_count);
+    println!("QR codes saved to: {}", output_dir.display());
+
+    Ok(())
+}
+
 fn save_qr_content(contents: &[(String, Zeroizing<String>)], settings: &AppSettings) -> AppResult<()> {
-    print!("Enter file path to save QR contents (or leave empty for default 'qr_batch_output.txt'): ");
+    print!("Enter file path to save QR contents (default: 'qr_batch_output.txt'): ");
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
@@ -224,7 +402,7 @@ fn save_qr_content(contents: &[(String, Zeroizing<String>)], settings: &AppSetti
 
     let mut output = Zeroizing::new(String::new());
     for (i, (file_path, content)) in contents.iter().enumerate() {
-        output.push_str(&format!("--- QR Code {} from {} ---\n", i + 1, file_path));
+        output.push_str(&format!("--- QR Code {} / {} ---\n", i + 1, file_path));
         output.push_str(&format!("Content: {}\n\n", content.as_str()));
     }
 
@@ -234,24 +412,24 @@ fn save_qr_content(contents: &[(String, Zeroizing<String>)], settings: &AppSetti
     #[cfg(unix)]
     {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .context(format!("Could not set permissions for file: {}", path.display()))?;
+            .context(format!("Could not set file permissions: {}", path.display()))?;
     }
     #[cfg(not(unix))]
     {
-        println!("Warning: File permissions not set (not supported on this platform).");
+        println!("Warning: Could not set file permissions (not supported on this platform).");
     }
     
-    println!("QR contents saved to {}", path.display());
+    println!("QR contents saved to: {}", path.display());
     Ok(())
 }
 
 fn batch_process_qr_codes(settings: &AppSettings) -> AppResult<()> {
-    println!("\n--- Batch Process QR Codes ---");
+    println!("\n--- Batch QR Code Processing ---");
     let default_dir = settings.scan_directory.as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or("Not set".to_string());
     println!("Current scan directory: {}", default_dir);
-    print!("Enter new scan directory (or press Enter to use current): ");
+    print!("Enter new scan directory (press Enter to use current): ");
     io::stdout().flush()?;
 
     let mut input = String::new();
@@ -260,14 +438,14 @@ fn batch_process_qr_codes(settings: &AppSettings) -> AppResult<()> {
         match &settings.scan_directory {
             Some(p) => p.clone(),
             None => {
-                println!("Error: No scan directory set. Please set one in Settings.");
+                println!("Error: Scan directory is not set. Please set a directory in Settings.");
                 return Ok(());
             }
         }
     } else {
         let new_dir = PathBuf::from(input.trim());
         if !new_dir.is_dir() {
-            println!("Error: The entered path is not a valid directory.");
+            println!("Error: The provided path is not a valid directory.");
             return Ok(());
         }
         new_dir
@@ -292,12 +470,12 @@ fn batch_process_qr_codes(settings: &AppSettings) -> AppResult<()> {
     }
 
     if files.is_empty() {
-        println!("No supported image files found in the directory (Supported: {:?}).", supported_extensions);
+        println!("No supported image files found in directory (Supported: {:?}).", supported_extensions);
         return Ok(());
     }
 
     files.sort();
-    println!("\nFound {} image(s) in '{}'. Processing...", files.len(), scan_dir.display());
+    println!("\nFound {} images in '{}'. Processing...", files.len(), scan_dir.display());
     let mut all_results = Vec::new();
 
     for (i, path) in files.iter().enumerate() {
@@ -305,7 +483,7 @@ fn batch_process_qr_codes(settings: &AppSettings) -> AppResult<()> {
         match process_image(path, settings) {
             Ok(results) => {
                 if results.is_empty() {
-                    println!("No QR codes found in {}.", path.display());
+                    println!("No QR code found in {}.", path.display());
                 } else {
                     all_results.extend(results);
                 }
@@ -319,13 +497,13 @@ fn batch_process_qr_codes(settings: &AppSettings) -> AppResult<()> {
         return Ok(());
     }
 
-    println!("\n{} unique QR code(s) successfully decoded!", all_results.len());
+    println!("\nSuccessfully decoded {} unique QR code(s)!", all_results.len());
     if settings.auto_copy_to_clipboard && all_results.len() == 1 {
         if let Some((_, content)) = all_results.first() {
             let copy_result = (|| -> Result<()> {
-                let mut clipboard = Clipboard::new().context("Failed to initialize clipboard")?;
+                let mut clipboard = Clipboard::new().context("Could not initialize clipboard")?;
                 clipboard.set_text(content.as_str().to_string())
-                    .context("Failed to copy content to clipboard")?;
+                    .context("Could not copy content to clipboard")?;
                 #[cfg(target_os = "linux")]
                 {
                     use std::thread;
@@ -336,7 +514,7 @@ fn batch_process_qr_codes(settings: &AppSettings) -> AppResult<()> {
             })();
 
             if copy_result.is_ok() {
-                println!("Content of the single QR code has been automatically copied to the clipboard.");
+                println!("Content of the single QR code was automatically copied to the clipboard.");
             } else if let Err(e) = copy_result {
                 eprintln!("Warning: Could not copy content to clipboard: {:?}", e);
             }
@@ -344,7 +522,7 @@ fn batch_process_qr_codes(settings: &AppSettings) -> AppResult<()> {
     }
 
     for (i, (file_path, content)) in all_results.iter().enumerate() {
-        println!("--- QR Code {} from {} ---", i + 1, file_path);
+        println!("--- QR Code {} / {} ---", i + 1, file_path);
         println!("Content: {}", content.as_str());
     }
 
@@ -361,11 +539,167 @@ fn batch_process_qr_codes(settings: &AppSettings) -> AppResult<()> {
     Ok(())
 }
 
+fn settings_menu(settings: &mut AppSettings) -> AppResult<()> {
+    let mut in_settings_menu = true;
+    while in_settings_menu {
+        println!("\n--- Settings Menu ---");
+
+        match &settings.scan_directory {
+            Some(p) => println!("1. Set Scan Directory (Current: {})", p.display()),
+            None => println!("1. Set Scan Directory (Current: NOT SET)"),
+        }
+
+        let auto_copy_status = if settings.auto_copy_to_clipboard { "Enabled" } else { "Disabled" };
+        println!("2. Toggle Auto-Copy to Clipboard (Current: {})", auto_copy_status);
+        
+        match &settings.output_directory {
+            Some(p) => println!("3. Set Output Directory (Current: {})", p.display()),
+            None => println!("3. Set Output Directory (Current: Scan directory will be used)"),
+        }
+        
+        println!("4. Return to Main Menu");
+        print!("Enter your choice (1-4): ");
+        io::stdout().flush()?;
+
+        let mut choice = String::new();
+        io::stdin().read_line(&mut choice)?;
+
+        match choice.trim() {
+            "1" => {
+                print!("Enter new Scan Directory path (leave empty to cancel): ");
+                io::stdout().flush()?;
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                let new_path_str = input.trim();
+
+                if !new_path_str.is_empty() {
+                    let path_buf = PathBuf::from(new_path_str);
+                    if path_buf.is_dir() {
+                        settings.scan_directory = Some(path_buf);
+                        println!("Scan directory updated successfully. Saving...");
+                        save_settings(settings)?;
+                    } else {
+                        println!("Error: The provided path is not a valid directory.");
+                    }
+                } else {
+                    println!("No path entered, operation cancelled.");
+                }
+            },
+            "2" => {
+                settings.auto_copy_to_clipboard = !settings.auto_copy_to_clipboard;
+                let new_status = if settings.auto_copy_to_clipboard { "Enabled" } else { "Disabled" };
+                println!("Auto-copy to clipboard is now {}. Saving...", new_status);
+                save_settings(settings)?;
+            },
+            "3" => {
+                print!("Enter new Output Directory path (leave empty for default): ");
+                io::stdout().flush()?;
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                let new_path_str = input.trim();
+
+                if !new_path_str.is_empty() {
+                    let path_buf = PathBuf::from(new_path_str);
+                    if path_buf.is_dir() {
+                        settings.output_directory = Some(path_buf);
+                        println!("Output directory updated successfully. Saving...");
+                        save_settings(settings)?;
+                    } else {
+                        println!("Error: The provided path is not a valid directory.");
+                    }
+                } else {
+                    settings.output_directory = None;
+                    println!("Output directory reset to default. Saving...");
+                    save_settings(settings)?;
+                }
+            },
+            "4" => {
+                in_settings_menu = false;
+            },
+            _ => {
+                println!("Invalid choice. Please enter 1, 2, 3, or 4.");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn main() -> AppResult<()> {
+    let mut settings = match load_settings() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Critical error loading settings: {:?}", e);
+            AppSettings::default()
+        }
+    };
+    
+    let mut running = true;
+
+    while running {
+        println!("\n--- Kripton QR Code Reader/Generator ---");
+        println!("1. Read QR Code from Image in Scan Directory");
+        println!("2. Read QR Code from Specific File");
+        println!("3. Batch Process QR Codes");
+        println!("4. Generate QR Code from Text");
+        println!("5. Batch Generate QR Codes (from Text File)");
+        println!("6. Settings");
+        println!("7. Exit");
+        print!("Enter your choice (1-7): ");
+        io::stdout().flush()?; 
+
+        let mut choice = String::new();
+        io::stdin().read_line(&mut choice)
+            .context("Failed to read input.")?;
+        
+        match choice.trim() {
+            "1" => {
+                if let Err(e) = read_qr_code(&settings) {
+                    eprintln!("Error: QR code reading failed: {:?}", e);
+                }
+            },
+            "2" => {
+                if let Err(e) = read_qr_from_file(&settings) {
+                    eprintln!("Error: QR code reading failed: {:?}", e);
+                }
+            },
+            "3" => {
+                if let Err(e) = batch_process_qr_codes(&settings) {
+                    eprintln!("Error: Batch QR processing failed: {:?}", e);
+                }
+            },
+            "4" => {
+                if let Err(e) = generate_qr_code(&settings) {
+                    eprintln!("Error: QR code generation failed: {:?}", e);
+                }
+            },
+            "5" => {
+                if let Err(e) = batch_generate_qr_codes(&settings) {
+                    eprintln!("Error: Batch QR generation failed: {:?}", e);
+                }
+            },
+            "6" => {
+                if let Err(e) = settings_menu(&mut settings) {
+                    eprintln!("Error: Failed to change settings: {:?}", e);
+                }
+            },
+            "7" => {
+                println!("Exiting application...");
+                running = false;
+            },
+            _ => {
+                println!("Invalid choice. Please enter 1, 2, 3, 4, 5, 6, or 7.");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn read_qr_code(settings: &AppSettings) -> AppResult<()> {
     let scan_dir = match &settings.scan_directory {
         Some(p) => p,
         None => {
-            println!("Error: Please set the scan directory first from menu 4.");
+            println!("Error: Please set the scan directory from menu 6 first.");
             return Ok(());
         }
     };
@@ -390,7 +724,7 @@ fn read_qr_code(settings: &AppSettings) -> AppResult<()> {
     }
 
     if files.is_empty() {
-        println!("No supported image files found in the directory (Supported: {:?}).", supported_extensions);
+        println!("No supported image files found in directory (Supported: {:?}).", supported_extensions);
         return Ok(());
     }
 
@@ -401,7 +735,7 @@ fn read_qr_code(settings: &AppSettings) -> AppResult<()> {
         println!("{}. {}", i + 1, file_name);
     }
 
-    print!("Please enter the number of the image to read (1-{}): ", files.len());
+    print!("Enter the number of the image to read (1-{}): ", files.len());
     io::stdout().flush()?;
 
     let mut choice = String::new();
@@ -410,7 +744,7 @@ fn read_qr_code(settings: &AppSettings) -> AppResult<()> {
     let index: usize = match choice.trim().parse::<usize>() {
         Ok(n) if n > 0 && n <= files.len() => n - 1,
         _ => {
-            println!("Invalid selection.");
+            println!("Invalid choice.");
             return Ok(());
         }
     };
@@ -418,18 +752,18 @@ fn read_qr_code(settings: &AppSettings) -> AppResult<()> {
     let path = &files[index];
     let results = process_image(path, settings)?;
     if results.is_empty() {
-        println!("No QR code could be decoded from the selected image.");
-        println!("Tried {} different processing techniques.", try_different_scales(&image::open(path)?).len());
+        println!("Could not decode QR code from selected image.");
+        println!("{} different processing techniques were tried.", try_different_scales(&image::open(path)?).len());
         return Ok(());
     }
 
-    println!("\n{} unique QR code(s) successfully decoded!", results.len());
+    println!("\nSuccessfully decoded {} unique QR code(s)!", results.len());
     if settings.auto_copy_to_clipboard && results.len() == 1 {
         if let Some((_, content)) = results.first() {
             let copy_result = (|| -> Result<()> {
-                let mut clipboard = Clipboard::new().context("Failed to initialize clipboard")?;
+                let mut clipboard = Clipboard::new().context("Could not initialize clipboard")?;
                 clipboard.set_text(content.as_str().to_string())
-                    .context("Failed to copy content to clipboard")?;
+                    .context("Could not copy content to clipboard")?;
                 #[cfg(target_os = "linux")]
                 {
                     use std::thread;
@@ -440,7 +774,7 @@ fn read_qr_code(settings: &AppSettings) -> AppResult<()> {
             })();
 
             if copy_result.is_ok() {
-                println!("Content of the QR code has been automatically copied to the clipboard.");
+                println!("Content of the single QR code was automatically copied to the clipboard.");
             } else if let Err(e) = copy_result {
                 eprintln!("Warning: Could not copy content to clipboard: {:?}", e);
             }
@@ -448,7 +782,7 @@ fn read_qr_code(settings: &AppSettings) -> AppResult<()> {
     }
 
     for (i, (file_path, content)) in results.iter().enumerate() {
-        println!("--- QR Code {} from {} ---", i + 1, file_path);
+        println!("--- QR Code {} / {} ---", i + 1, file_path);
         println!("Content: {}", content.as_str());
     }
 
@@ -456,7 +790,7 @@ fn read_qr_code(settings: &AppSettings) -> AppResult<()> {
 }
 
 fn read_qr_from_file(settings: &AppSettings) -> AppResult<()> {
-    print!("Enter the full path to the image file (or leave empty to cancel): ");
+    print!("Enter the full path to the image file (leave empty to cancel): ");
     io::stdout().flush()?;
 
     let mut input = String::new();
@@ -470,7 +804,7 @@ fn read_qr_from_file(settings: &AppSettings) -> AppResult<()> {
 
     let path = PathBuf::from(path_str);
     if !path.is_file() {
-        println!("Error: The entered path is not a valid file.");
+        println!("Error: The provided path is not a valid file.");
         return Ok(());
     }
 
@@ -481,24 +815,24 @@ fn read_qr_from_file(settings: &AppSettings) -> AppResult<()> {
             return Ok(());
         }
     } else {
-        println!("No file extension found.");
+        println!("Could not find file extension.");
         return Ok(());
     }
 
     let results = process_image(&path, settings)?;
     if results.is_empty() {
-        println!("No QR code could be decoded from the selected image.");
-        println!("Tried {} different processing techniques.", try_different_scales(&image::open(&path)?).len());
+        println!("Could not decode QR code from selected image.");
+        println!("{} different processing techniques were tried.", try_different_scales(&image::open(&path)?).len());
         return Ok(());
     }
 
-    println!("\n{} unique QR code(s) successfully decoded!", results.len());
+    println!("\nSuccessfully decoded {} unique QR code(s)!", results.len());
     if settings.auto_copy_to_clipboard && results.len() == 1 {
         if let Some((_, content)) = results.first() {
             let copy_result = (|| -> Result<()> {
-                let mut clipboard = Clipboard::new().context("Failed to initialize clipboard")?;
+                let mut clipboard = Clipboard::new().context("Could not initialize clipboard")?;
                 clipboard.set_text(content.as_str().to_string())
-                    .context("Failed to copy content to clipboard")?;
+                    .context("Could not copy content to clipboard")?;
                 #[cfg(target_os = "linux")]
                 {
                     use std::thread;
@@ -509,7 +843,7 @@ fn read_qr_from_file(settings: &AppSettings) -> AppResult<()> {
             })();
 
             if copy_result.is_ok() {
-                println!("Content of the QR code has been automatically copied to the clipboard.");
+                println!("Content of the single QR code was automatically copied to the clipboard.");
             } else if let Err(e) = copy_result {
                 eprintln!("Warning: Could not copy content to clipboard: {:?}", e);
             }
@@ -517,125 +851,8 @@ fn read_qr_from_file(settings: &AppSettings) -> AppResult<()> {
     }
 
     for (i, (file_path, content)) in results.iter().enumerate() {
-        println!("--- QR Code {} from {} ---", i + 1, file_path);
+        println!("--- QR Code {} / {} ---", i + 1, file_path);
         println!("Content: {}", content.as_str());
-    }
-
-    Ok(())
-}
-
-fn settings_menu(settings: &mut AppSettings) -> AppResult<()> {
-    let mut in_settings_menu = true;
-    while in_settings_menu {
-        println!("\n--- Settings Menu ---");
-
-        match &settings.scan_directory {
-            Some(p) => println!("1. Set Scan Directory (Current: {})", p.display()),
-            None => println!("1. Set Scan Directory (Current: NOT SET)"),
-        }
-
-        let auto_copy_status = if settings.auto_copy_to_clipboard { "Enabled" } else { "Disabled" };
-        println!("2. Toggle Auto-copy to Clipboard (Current: {})", auto_copy_status);
-        
-        println!("3. Back to Main Menu");
-        print!("Make your selection (1-3): ");
-        io::stdout().flush()?;
-
-        let mut choice = String::new();
-        io::stdin().read_line(&mut choice)?;
-
-        match choice.trim() {
-            "1" => {
-                print!("Enter New Scan Directory Path (or leave empty to cancel): ");
-                io::stdout().flush()?;
-                let mut input = String::new();
-                io::stdin().read_line(&mut input)?;
-                let new_path_str = input.trim();
-
-                if !new_path_str.is_empty() {
-                    let path_buf = PathBuf::from(new_path_str);
-                    if path_buf.is_dir() {
-                        settings.scan_directory = Some(path_buf);
-                        println!("Scan directory updated successfully. Saving...");
-                        save_settings(settings)?;
-                    } else {
-                        println!("Error: The entered path is not a valid directory.");
-                    }
-                } else {
-                    println!("No path entered, operation cancelled.");
-                }
-            },
-            "2" => {
-                settings.auto_copy_to_clipboard = !settings.auto_copy_to_clipboard;
-                let new_status = if settings.auto_copy_to_clipboard { "Enabled" } else { "Disabled" };
-                println!("Auto-copy to clipboard is now {}. Saving...", new_status);
-                save_settings(settings)?;
-            },
-            "3" => {
-                in_settings_menu = false;
-            },
-            _ => {
-                println!("Invalid selection. Please enter 1, 2, or 3.");
-            }
-        }
-    }
-    Ok(())
-}
-
-fn main() -> AppResult<()> {
-    let mut settings = match load_settings() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Critical error while loading settings: {:?}", e);
-            AppSettings::default()
-        }
-    };
-    
-    let mut running = true;
-
-    while running {
-        println!("\n--- Kripton QR Code Reader ---");
-        println!("1. Read QR Code from Images in Scan Directory");
-        println!("2. Read QR Code from a Specific File");
-        println!("3. Batch Process QR Codes");
-        println!("4. Settings");
-        println!("5. Exit");
-        print!("Make your selection (1-5): ");
-        io::stdout().flush()?; 
-
-        let mut choice = String::new();
-        io::stdin().read_line(&mut choice)
-            .context("Could not read input.")?;
-        
-        match choice.trim() {
-            "1" => {
-                if let Err(e) = read_qr_code(&settings) {
-                    eprintln!("Error: QR code reading failed: {:?}", e);
-                }
-            },
-            "2" => {
-                if let Err(e) = read_qr_from_file(&settings) {
-                    eprintln!("Error: QR code reading failed: {:?}", e);
-                }
-            },
-            "3" => {
-                if let Err(e) = batch_process_qr_codes(&settings) {
-                    eprintln!("Error: Batch QR code processing failed: {:?}", e);
-                }
-            },
-            "4" => {
-                if let Err(e) = settings_menu(&mut settings) {
-                    eprintln!("Error: Could not change settings: {:?}", e);
-                }
-            },
-            "5" => {
-                println!("Exiting application...");
-                running = false;
-            },
-            _ => {
-                println!("Invalid selection. Please enter 1, 2, 3, 4, or 5.");
-            }
-        }
     }
 
     Ok(())
